@@ -139,23 +139,8 @@
     <canvas id="canvas" role="img" aria-label="Bezier rope simulation"></canvas>
 
     <script>
-        /**
-         * Bezier Rope — cleaned and annotated single-file implementation.
-         *
-         * Sections:
-         *  - utilities & setup
-         *  - math: vectors & bezier evaluation/derivative
-         *  - ControlPoint physics
-         *  - input handling (mouse/touch/gyro)
-         *  - rendering loop
-         *  - recording
-         *
-         * The behavior is intentionally simple and readable so you can adapt it.
-         */
-
-        // ------------------------------
         // Utilities & setup
-        // ------------------------------
+      
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d', { alpha: false });
         let DPR = Math.max(1, window.devicePixelRatio || 1);
