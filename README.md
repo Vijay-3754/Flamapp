@@ -58,3 +58,5 @@ Recording notes
 Notes & known limitations
 - Gyroscope: iOS requires explicit permission prompt; behavior varies by browser/OS.
 - The app attempts to maintain responsive 60 FPS but ultimate performance depends on device CPU/GPU. Use the UI sliders to reduce sampling/tangent density on lower-end devices.
+  Video Demo Link
+- https://github.com/user-attachments/assets/b9e0a444-9970-46af-b022-4da0da78b052
