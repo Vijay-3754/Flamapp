@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <title>Bezier Rope — Canvas Simulation</title>
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            background: #081018;
+            color: #dbeefc;
+            font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        #ui {
+            position: absolute;
+            left: 12px;
+            top: 12px;
+            background: rgba(6, 10, 14, 0.6);
+            padding: 10px;
+            border-radius: 8px;
+            z-index: 10;
+            backdrop-filter: blur(6px);
+        }
+
+        #ui label {
+            display: block;
+            font-size: 13px;
+            margin: 6px 0 2px;
+            color: #bcd3ee
+        }
+
+        #ui input[type=range] {
+            width: 200px;
+        }
+
+        button {
+            background: #1f6feb;
+            color: white;
+            border: 0;
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            margin-right: 6px;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+
+        #fps {
+            font-weight: 700;
+            margin-left: 8px;
+            color: #8be18b;
+            display: inline-block;
+            min-width: 56px;
+            text-align: center;
+        }
+
+        small.note {
+            color: #9fb6d6;
+            display: block;
+            margin-top: 6px;
+        }
+
+        .row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="ui" aria-hidden="false">
+        <div class="row" style="align-items:center;">
+            <button id="gyroBtn">Enable Gyro</button>
+            <button id="recordBtn">Record</button>
+            <button id="stopRecBtn" disabled>Stop</button>
+            <div id="fps">-- FPS</div>
+        </div>
+
+        <label>spring k: <span id="kVal">120</span></label>
+        <input id="k" type="range" min="10" max="600" value="120" />
+
+        <label>damping: <span id="dVal">12</span></label>
+        <input id="d" type="range" min="0" max="60" value="12" />
+
+        <label>influence (px): <span id="infVal">160</span></label>
+        <input id="influence" type="range" min="0" max="360" value="160" />
+
+        <label>tangent spacing t-step: <span id="tstepVal">0.05</span></label>
+        <input id="tstep" type="range" min="0.01" max="0.2" step="0.01" value="0.05" />
+
+        <small class="note">Drag the colored middle control points or move mouse/touch. On iOS Safari: tap "Enable Gyro"
+            then allow motion access. Use Record to capture up to 30s.</small>
+        <div id="recStatus" style="margin-top:6px;font-size:12px;color:#d0eaff;"></div>
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <script>
+        /*
+          Bezier Rope — Single-file implementation.
+          Organized sections:
+           - Setup & Utilities
+           - Math (Bezier & vectors)
+           - Physics (ControlPoint, spring model)
+           - Input (mouse/touch/gyro, dragging)
+           - Rendering (curve sampling + tangents)
+           - Recording (MediaRecorder for canvas)
+        */
+
+        // ------------------------------
+        // Setup & Utilities
+        // ------------------------------
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d', { alpha: false });
+        let DPR = Math.max(1, window.devicePixelRatio || 1);
+
+        function resizeCanvas() {
+            DPR = Math.max(1, window.devicePixelRatio || 1);
+            canvas.width = Math.floor(window.innerWidth * DPR);
+            canvas.height = Math.floor(window.innerHeight * DPR);
+            canvas.style.width = window.innerWidth + 'px';
+            canvas.style.height = window.innerHeight + 'px';
+            ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        }
+        window.addEventListener('resize', resizeCanvas, { passive: true });
+        resizeCanvas();
+
+        function v(x = 0, y = 0) { return { x: x, y: y }; }
+        function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
+        function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }
+        function mul(a, s) { return { x: a.x * s, y: a.y * s }; }
+        function len(a) { return Math.hypot(a.x, a.y); }
+        function normalize(a) { const L = Math.hypot(a.x, a.y) || 1; return { x: a.x / L, y: a.y / L }; }
+        function lerp(a, b, t) { return a + (b - a) * t; }
+
+        // ------------------------------
+        // Math: Bezier evaluation & derivative
+        // ------------------------------
+        function cubicBezierPoint(t, P0, P1, P2, P3) {
+            // B(t) = (1−t)^3 P0 + 3(1−t)^2 t P1 + 3(1−t) t^2 P2 + t^3 P3
+            const u = 1 - t;
+            const u2 = u * u, u3 = u2 * u;
+            const t2 = t * t, t3 = t2 * t;
+            const x = u3 * P0.x + 3 * u2 * t * P1.x + 3 * u * t2 * P2.x + t3 * P3.x;
+            const y = u3 * P0.y + 3 * u2 * t * P1.y + 3 * u * t2 * P2.y + t3 * P3.y;
+            return { x, y };
+        }
+
+        function cubicBezierDerivative(t, P0, P1, P2, P3) {
+            // B'(t) = 3(1−t)^2 (P1−P0) + 6(1−t)t (P2−P1) + 3 t^2 (P3−P2)
+            const u = 1 - t;
+            const u2 = u * u;
+            const t2 = t * t;
+            const term1 = mul(sub(P1, P0), 3 * u2);
+            const term2 = mul(sub(P2, P1), 6 * u * t);
+            const term3 = mul(sub(P3, P2), 3 * t2);
+            return add(add(term1, term2), term3);
+        }
+
+        // ------------------------------
+        // Physics: Control points & spring model
+        // ------------------------------
+        class ControlPoint {
+            constructor(x, y, fixed = false) {
+                this.pos = v(x, y);
+                this.vel = v(0, 0);
+                this.target = v(x, y);
+                this.base = v(x, y); // rest position
+                this.fixed = !!fixed;
+                this.radius = 8;
+            }
+            setTarget(x, y) {
+                this.target.x = x; this.target.y = y;
+            }
+            snapTo(x, y) {
+                this.pos.x = x; this.pos.y = y;
+                this.vel.x = 0; this.vel.y = 0;
+                this.target.x = x; this.target.y = y;
+                this.base.x = x; this.base.y = y;
+            }
+            update(dt, k, damping) {
+                if (this.fixed) return;
+                // acceleration = -k*(pos-target) - damping*vel
+                const dx = this.pos.x - this.target.x;
+                const dy = this.pos.y - this.target.y;
+                const ax = -k * dx - damping * this.vel.x;
+                const ay = -k * dy - damping * this.vel.y;
+                this.vel.x += ax * dt;
+                this.vel.y += ay * dt;
+                this.pos.x += this.vel.x * dt;
+                this.pos.y += this.vel.y * dt;
+            }
+        }
+
+        // Initialize control points (P0,P1,P2,P3)
+        let P0 = new ControlPoint(80, window.innerHeight / 2, true);
+        let P3 = new ControlPoint(window.innerWidth - 80, window.innerHeight / 2, true);
+        let P1 = new ControlPoint(window.innerWidth * 0.33, window.innerHeight / 2, false);
+        let P2 = new ControlPoint(window.innerWidth * 0.66, window.innerHeight / 2, false);
+
+        function layoutBasePoints() {
+            P0.snapTo(80, window.innerHeight / 2);
+            P3.snapTo(window.innerWidth - 80, window.innerHeight / 2);
+            P1.base = v(lerp(P0.pos.x, P3.pos.x, 0.33), lerp(P0.pos.y, P3.pos.y, 0.33));
+            P2.base = v(lerp(P0.pos.x, P3.pos.x, 0.66), lerp(P0.pos.y, P3.pos.y, 0.66));
+            // gently place current positions at base if not far
+            P1.setTarget(P1.base.x, P1.base.y);
+            P2.setTarget(P2.base.x, P2.base.y);
+        }
+        layoutBasePoints();
+        window.addEventListener('resize', layoutBasePoints, { passive: true });
+
+        // ------------------------------
+        // Input: pointer, dragging, gyroscope
+        // ------------------------------
+        const pointer = { x: window.innerWidth / 2, y: window.innerHeight / 2, down: false };
+        function setPointerFromEvent(e) {
+            if (e.touches && e.touches.length > 0) {
+                pointer.x = e.touches[0].clientX;
+                pointer.y = e.touches[0].clientY;
+            } else {
+                pointer.x = e.clientX;
+                pointer.y = e.clientY;
+            }
+        }
+
+        window.addEventListener('mousemove', (e) => setPointerFromEvent(e), { passive: true });
+        window.addEventListener('touchmove', (e) => { setPointerFromEvent(e); e.preventDefault(); }, { passive: false });
+
+        let dragging = null; // 'p1' | 'p2' | null
+        function hitTest(cp, x, y) {
+            const dx = cp.pos.x - x, dy = cp.pos.y - y;
+            return dx * dx + dy * dy <= (cp.radius + 6) * (cp.radius + 6);
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            const x = e.clientX, y = e.clientY;
+            if (hitTest(P1, x, y)) { dragging = 'p1'; pointer.down = true; }
+            else if (hitTest(P2, x, y)) { dragging = 'p2'; pointer.down = true; }
+            else { pointer.down = true; }
+        }, { passive: true });
+        canvas.addEventListener('mouseup', () => { dragging = null; pointer.down = false; }, { passive: true });
+        canvas.addEventListener('mouseleave', () => { pointer.down = false; dragging = null; }, { passive: true });
+
+        canvas.addEventListener('touchstart', (e) => {
+            const t = e.touches[0];
+            const x = t.clientX, y = t.clientY;
+            if (hitTest(P1, x, y)) { dragging = 'p1'; pointer.down = true; }
+            else if (hitTest(P2, x, y)) { dragging = 'p2'; pointer.down = true; }
+            else { pointer.down = true; }
+            e.preventDefault();
+        }, { passive: false });
+        canvas.addEventListener('touchend', () => { dragging = null; pointer.down = false; }, { passive: true });
+
+        /* Gyroscope (DeviceOrientation) */
+        const gyroBtn = document.getElementById('gyroBtn');
+        let gyroEnabled = false;
+        let gyroOffset = v(0, 0);
+
+        async function enableGyro() {
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                try {
+                    const res = await DeviceOrientationEvent.requestPermission();
+                    if (res !== 'granted') { alert('Gyro permission not granted'); return; }
+                } catch (e) { alert('Gyro permission error: ' + e); return; }
+            }
+            window.addEventListener('deviceorientation', handleDeviceOrientation, true);
+            gyroEnabled = true;
+            gyroBtn.textContent = 'Gyro: On';
+        }
+        function disableGyro() {
+            window.removeEventListener('deviceorientation', handleDeviceOrientation, true);
+            gyroEnabled = false;
+            gyroBtn.textContent = 'Enable Gyro';
+        }
+        function handleDeviceOrientation(e) {
+            if (e.beta === null || e.gamma === null) return;
+            const inf = Number(document.getElementById('influence').value);
+            // e.gamma: left-right tilt (-90..90); e.beta: front-back (-180..180)
+            // Map to px offsets and smooth
+            gyroOffset.x = lerp(gyroOffset.x, (e.gamma / 90) * inf, 0.12);
+            gyroOffset.y = lerp(gyroOffset.y, (e.beta / 90) * inf, 0.12);
+        }
+        gyroBtn.addEventListener('click', () => {
+            if (!gyroEnabled) enableGyro(); else disableGyro();
+        });
+
+        // ------------------------------
+        // UI bindings
+        // ------------------------------
+        const kSlider = document.getElementById('k');
+        const dSlider = document.getElementById('d');
+        const infSlider = document.getElementById('influence');
+        const tstepSlider = document.getElementById('tstep');
+        const kVal = document.getElementById('kVal');
+        const dVal = document.getElementById('dVal');
+        const infVal = document.getElementById('infVal');
+        const tstepVal = document.getElementById('tstepVal');
+        function updateUI() { kVal.textContent = kSlider.value; dVal.textContent = dSlider.value; infVal.textContent = infSlider.value; tstepVal.textContent = Number(tstepSlider.value).toFixed(2); }
+        kSlider.addEventListener('input', updateUI);
+        dSlider.addEventListener('input', updateUI);
+        infSlider.addEventListener('input', updateUI);
+        tstepSlider.addEventListener('input', updateUI);
+        updateUI();
+
+        // ------------------------------
+        // Rendering
+        // ------------------------------
+        function drawCircle(pt, r, fill, stroke) {
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+            ctx.fillStyle = fill;
+            ctx.fill();
+            if (stroke) {
+                ctx.lineWidth = stroke.width;
+                ctx.strokeStyle = stroke.color;
+                ctx.stroke();
+            }
+        }
+
+        // Physics & render loop variables
+        let lastTime = performance.now();
+        let fpsSmoothed = 60;
+        const PHYS_DT = 1 / 240; // fixed physics timestep (seconds)
+        let physAccumulator = 0;
+
+        function render(now) {
+            const rawDt = Math.min(0.05, (now - lastTime) / 1000); // clamp large jumps
+            lastTime = now;
+            fpsSmoothed = fpsSmoothed * 0.95 + (1 / rawDt) * 0.05;
+            document.getElementById('fps').textContent = (fpsSmoothed | 0) + ' FPS';
+
+            // accumulate for physics
+            physAccumulator += rawDt;
+            const k = Number(kSlider.value);
+            const damping = Number(dSlider.value);
+            const influence = Number(infSlider.value);
+
+            while (physAccumulator >= PHYS_DT) {
+                // Determine targets for P1/P2
+                if (dragging === 'p1') {
+                    P1.setTarget(pointer.x, pointer.y);
+                    // small velocity damping while dragging
+                    P1.vel.x *= 0.9; P1.vel.y *= 0.9;
+                } else if (dragging === 'p2') {
+                    P2.setTarget(pointer.x, pointer.y);
+                    P2.vel.x *= 0.9; P2.vel.y *= 0.9;
+                } else {
+                    // Map pointer & gyro offset to targets relative to centerline
+                    const centerX = (P0.pos.x + P3.pos.x) / 2;
+                    const centerY = (P0.pos.y + P3.pos.y) / 2;
+                    const dir = { x: pointer.x - centerX, y: pointer.y - centerY };
+                    const nd = normalize(dir);
+                    const base1 = P1.base;
+                    const base2 = P2.base;
+                    const offsetX1 = nd.x * influence * 0.7 - nd.y * influence * 0.15;
+                    const offsetY1 = nd.y * influence * 0.7 + nd.x * influence * 0.05;
+                    const offsetX2 = nd.x * influence * 0.9 + nd.y * influence * 0.12;
+                    const offsetY2 = nd.y * influence * 0.9 - nd.x * influence * 0.05;
+                    P1.setTarget(base1.x + offsetX1 + gyroOffset.x * 0.6, base1.y + offsetY1 + gyroOffset.y * 0.6);
+                    P2.setTarget(base2.x + offsetX2 + gyroOffset.x * 0.9, base2.y + offsetY2 + gyroOffset.y * 0.9);
+                }
+
+                // Relax targets toward base if no pointer down
+                if (!pointer.down && !dragging) {
+                    P1.target.x = lerp(P1.target.x, P1.base.x, 0.06);
+                    P1.target.y = lerp(P1.target.y, P1.base.y, 0.06);
+                    P2.target.x = lerp(P2.target.x, P2.base.x, 0.06);
+                    P2.target.y = lerp(P2.target.y, P2.base.y, 0.06);
+                }
+
+                // Integrate physics
+                P1.update(PHYS_DT, k, damping);
+                P2.update(PHYS_DT, k, damping);
+
+                physAccumulator -= PHYS_DT;
+            }
+
+            // Clear & background
+            ctx.fillStyle = '#061018';
+            ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+            // subtle radial highlight
+            const grad = ctx.createRadialGradient(window.innerWidth * 0.5, window.innerHeight * 0.45, 10, window.innerWidth * 0.5, window.innerHeight * 0.45, Math.max(window.innerWidth, window.innerHeight));
+            grad.addColorStop(0, 'rgba(255,255,255,0.02)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+            // Draw bezier curve by manual sampling (t increment 0.01)
+            ctx.lineWidth = 3.5;
+            ctx.strokeStyle = 'rgba(25,200,255,0.95)';
+            ctx.beginPath();
+            let first = true;
+            for (let t = 0; t <= 1 + 1e-9; t += 0.01) {
+                const p = cubicBezierPoint(t, P0.pos, P1.pos, P2.pos, P3.pos);
+                if (first) { ctx.moveTo(p.x, p.y); first = false; }
+                else ctx.lineTo(p.x, p.y);
+            }
+            ctx.stroke();
+
+            // Draw tangents at intervals from UI
+            const tstep = Number(tstepSlider.value);
+            ctx.lineWidth = 2;
+            for (let t = 0; t <= 1 + 1e-9; t += tstep) {
+                const p = cubicBezierPoint(t, P0.pos, P1.pos, P2.pos, P3.pos);
+                const d = cubicBezierDerivative(t, P0.pos, P1.pos, P2.pos, P3.pos);
+                const n = normalize(d);
+                const lenPixels = 28;
+                ctx.beginPath();
+                ctx.strokeStyle = 'rgba(255,240,120,0.95)';
+                ctx.moveTo(p.x - n.x * lenPixels * 0.5, p.y - n.y * lenPixels * 0.5);
+                ctx.lineTo(p.x + n.x * lenPixels * 0.5, p.y + n.y * lenPixels * 0.5);
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.fillStyle = 'rgba(255,200,70,0.95)';
+                ctx.arc(p.x + n.x * lenPixels * 0.6, p.y + n.y * lenPixels * 0.6, 2.2, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Control polygon (light)
+            ctx.lineWidth = 1.2;
+            ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+            ctx.beginPath();
+            ctx.moveTo(P0.pos.x, P0.pos.y);
+            ctx.lineTo(P1.pos.x, P1.pos.y);
+            ctx.lineTo(P2.pos.x, P2.pos.y);
+            ctx.lineTo(P3.pos.x, P3.pos.y);
+            ctx.stroke();
+
+            // Draw control points
+            drawCircle(P0.pos, 6.5, '#5cd0ff', { color: 'rgba(255,255,255,0.12)', width: 2 });
+            drawCircle(P3.pos, 6.5, '#5cd0ff', { color: 'rgba(255,255,255,0.12)', width: 2 });
+            drawCircle(P1.pos, P1.radius + 2, 'rgba(245,100,150,0.95)', { color: 'rgba(255,255,255,0.12)', width: 2 });
+            drawCircle(P2.pos, P2.radius + 2, 'rgba(100,245,190,0.95)', { color: 'rgba(255,255,255,0.12)', width: 2 });
+
+            // pointer indicator
+            ctx.beginPath();
+            ctx.fillStyle = 'rgba(0,0,0,0.18)';
+            ctx.arc(pointer.x, pointer.y + 6, 6, 0, Math.PI * 2);
+            ctx.fill();
+
+            // labels
+            ctx.font = '12px system-ui,Segoe UI,Roboto';
+            ctx.fillStyle = 'rgba(220,240,255,0.9)';
+            ctx.fillText('P0', P0.pos.x - 24, P0.pos.y - 12);
+            ctx.fillText('P1', P1.pos.x - 24, P1.pos.y - 12);
+            ctx.fillText('P2', P2.pos.x + 8, P2.pos.y - 12);
+            ctx.fillText('P3', P3.pos.x + 8, P3.pos.y - 12);
+
+            requestAnimationFrame(render);
+        }
+        requestAnimationFrame(render);
+
+        // ------------------------------
+        // Recording: MediaRecorder for canvas (up to 30s)
+        // ------------------------------
+        const recordBtn = document.getElementById('recordBtn');
+        const stopRecBtn = document.getElementById('stopRecBtn');
+        const recStatus = document.getElementById('recStatus');
+        let mediaRecorder = null;
+        let recordedChunks = [];
+        let recTimeout = null;
+        let recStartTime = 0;
+
+        recordBtn.addEventListener('click', async () => {
+            if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+                // Start recording
+                const stream = canvas.captureStream(60); // request 60fps stream
+                recordedChunks = [];
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+                mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recordedChunks.push(e.data); };
+                mediaRecorder.onstop = onRecordingStop;
+                mediaRecorder.start(100); // gather data in small chunks
+                recStartTime = performance.now();
+                recStatus.textContent = 'Recording... 0s';
+                recordBtn.disabled = true;
+                stopRecBtn.disabled = false;
+
+                // auto-stop at 30s
+                recTimeout = setTimeout(() => {
+                    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+                }, 30000);
+
+                // small interval to update status seconds
+                const statusInterval = setInterval(() => {
+                    if (!mediaRecorder || mediaRecorder.state !== 'recording') { clearInterval(statusInterval); return; }
+                    const secs = Math.min(30, Math.floor((performance.now() - recStartTime) / 1000));
+                    recStatus.textContent = `Recording... ${secs}s`;
+                }, 250);
+            }
+        });
+
+        stopRecBtn.addEventListener('click', () => {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+        });
+
+        function onRecordingStop() {
+            clearTimeout(recTimeout);
+            recordBtn.disabled = false;
+            stopRecBtn.disabled = true;
+            const blob = new Blob(recordedChunks, { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'bezier-rope-recording.webm';
+            a.textContent = 'Download recording';
+            a.style.display = 'inline-block';
+            a.style.marginTop = '6px';
+            a.style.color = '#9fe2a6';
+            // calculate size
+            const sizeMB = (blob.size / (1024 * 1024)).toFixed(2);
+            recStatus.innerHTML = `Recording ready — ${sizeMB} MB. `;
+            recStatus.appendChild(a);
+            // free memory after some time
+            setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        }
+
+        // ------------------------------
+        // Expose for debugging
+        // ------------------------------
+        window._bezier = { P0, P1, P2, P3 };
+    </script>
+</body>
+
+</html>
